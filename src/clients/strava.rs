@@ -1,3 +1,8 @@
+//! Strava API client for handling authentication and API requests.
+//!
+//! This module provides a client for interacting with the Strava API v3,
+//! including automatic token refresh and activity management.
+
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,6 +27,10 @@ struct TokenState {
     expires_at: u64,
 }
 
+/// Strava API client with automatic token refresh.
+///
+/// Handles OAuth2 token management and provides methods to interact
+/// with the Strava API v3 endpoints.
 pub struct StravaClient {
     http: Client,
     base: Url,
@@ -30,29 +39,70 @@ pub struct StravaClient {
     token: Arc<Mutex<TokenState>>,
 }
 
+/// Summary information for a Strava activity.
+///
+/// Contains the basic fields returned from the Strava API
+/// when listing activities.
 #[derive(Debug, Deserialize)]
 pub struct StravaActivitySummary {
+    /// Unique identifier for the activity
     id: u64,
+    /// The name of the activity
     name: String,
+    /// Type of activity (e.g., "Ride", "Run", "Swim")
     #[serde(rename = "type")]
     activity_type: String,
+    /// ISO 8601 formatted date string
     start_date: String,
+    /// Distance in meters
     distance: u64,
+    /// Whether the activity is private
     private: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Parameters for updating a Strava activity.
+///
+/// All fields are optional - only provided fields will be updated.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct UpdateDetails {
+    /// Whether to hide this activity from the home feed
     hide_from_home: Option<bool>,
+    /// The name of the activity
     name: Option<String>,
+    /// Description of the activity
     description: Option<String>,
+    /// Whether this activity is a commute
     commute: Option<bool>,
+    /// Whether this activity was on a trainer
     trainer: Option<bool>,
+    /// Sport type of the activity
     sport_type: Option<String>,
+    /// Identifier for the gear used
     gear_id: Option<String>,
 }
 
 impl StravaClient {
+    /// Creates a new Strava API client.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Your Strava application's client ID
+    /// * `secret` - Your Strava application's client secret
+    /// * `initial_refresh_token` - A valid refresh token for OAuth2
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client fails to build or the base URL is invalid.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// let client = StravaClient::new(
+    ///     "client_id".to_string(),
+    ///     "client_secret".to_string(),
+    ///     "refresh_token".to_string()
+    /// )?;
+    /// ```
     pub fn new(id: String, secret: String, initial_refresh_token: String) -> anyhow::Result<Self> {
         Ok(Self {
             http: Client::builder()
@@ -79,7 +129,14 @@ impl StravaClient {
         token_state.expires_at.saturating_sub(current_time) < five_minutes_buffer
     }
 
-    pub async fn refresh_access_token(&self) -> anyhow::Result<()> {
+    /// Refreshes the OAuth2 access token using the refresh token.
+    ///
+    /// This is called automatically when the token is expired or about to expire.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the token refresh request fails or returns invalid data.
+    async fn refresh_access_token(&self) -> anyhow::Result<()> {
         let refresh_token = {
             let token_state = self.token.lock().unwrap();
             token_state.refresh_token.clone()
@@ -122,6 +179,28 @@ impl StravaClient {
         Ok(token_state.access_token.clone())
     }
 
+    /// Fetches a list of the authenticated athlete's activities.
+    ///
+    /// # Arguments
+    ///
+    /// * `page` - Page number (1-indexed)
+    /// * `per_page` - Number of activities per page (max 200)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails or returns invalid data.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example(client: &StravaClient) -> anyhow::Result<()> {
+    /// let activities = client.get_all_activities(1, 50).await?;
+    /// for activity in activities {
+    ///     println!("Activity: {}", activity.name);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn get_all_activities(
         &self,
         page: u32,
@@ -153,6 +232,30 @@ impl StravaClient {
         Ok(activities)
     }
 
+    /// Updates an existing Strava activity.
+    ///
+    /// # Arguments
+    ///
+    /// * `activity_id` - The ID of the activity to update
+    /// * `update_details` - The fields to update (all fields are optional)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the activity doesn't exist or the update fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example(client: &StravaClient) -> anyhow::Result<()> {
+    /// let updates = UpdateDetails {
+    ///     name: Some("Morning Run".to_string()),
+    ///     description: Some("Great weather!".to_string()),
+    ///     ..Default::default()
+    /// };
+    /// let updated = client.update_activity("12345".to_string(), updates).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn update_activity(
         &self,
         activity_id: String,
