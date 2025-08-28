@@ -1,23 +1,21 @@
-//! Strava API client for handling authentication and API requests.
-//!
-//! This module provides a client for interacting with the Strava API v3,
-//! including automatic token refresh and activity management.
-
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use url::Url;
+
+const VIRTUAL_RIDE_ACTIVITY_TYPE: &str = "VirtualRide";
+const BIKE_RIDE_ACTIVITY_TYPE: &str = "Ride";
 
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
     refresh_token: String,
     expires_at: u64,
-    expires_in: u64,
-    token_type: String,
 }
 
 #[derive(Debug)]
@@ -27,82 +25,57 @@ struct TokenState {
     expires_at: u64,
 }
 
-/// Strava API client with automatic token refresh.
-///
-/// Handles OAuth2 token management and provides methods to interact
-/// with the Strava API v3 endpoints.
 pub struct StravaClient {
     http: Client,
     base: Url,
     client_id: String,
     client_secret: String,
     token: Arc<Mutex<TokenState>>,
+    processed_activities: Arc<Mutex<HashSet<u64>>>,
 }
 
-/// Summary information for a Strava activity.
-///
-/// Contains the basic fields returned from the Strava API
-/// when listing activities.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct StravaActivitySummary {
-    /// Unique identifier for the activity
-    id: u64,
-    /// The name of the activity
-    name: String,
-    /// Type of activity (e.g., "Ride", "Run", "Swim")
+    pub id: u64,
+    pub name: String,
     #[serde(rename = "type")]
-    activity_type: String,
-    /// ISO 8601 formatted date string
-    start_date: String,
-    /// Distance in meters
-    distance: u64,
-    /// Whether the activity is private
-    private: bool,
+    pub activity_type: String,
+    pub start_date: String,
+    pub distance: f64,
+    pub private: bool,
 }
 
-/// Parameters for updating a Strava activity.
-///
-/// All fields are optional - only provided fields will be updated.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct UpdateDetails {
-    /// Whether to hide this activity from the home feed
     hide_from_home: Option<bool>,
-    /// The name of the activity
     name: Option<String>,
-    /// Description of the activity
     description: Option<String>,
-    /// Whether this activity is a commute
     commute: Option<bool>,
-    /// Whether this activity was on a trainer
     trainer: Option<bool>,
-    /// Sport type of the activity
     sport_type: Option<String>,
-    /// Identifier for the gear used
     gear_id: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ActivityMatch {
+    pub indoor_activity: ActivityInfo,
+    pub virtual_ride: ActivityInfo,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ActivityInfo {
+    pub id: u64,
+    pub name: String,
+    pub start_date: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CleanupResult {
+    pub hidden: Vec<u64>,
+    pub matches: Vec<ActivityMatch>,
+}
+
 impl StravaClient {
-    /// Creates a new Strava API client.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - Your Strava application's client ID
-    /// * `secret` - Your Strava application's client secret
-    /// * `initial_refresh_token` - A valid refresh token for OAuth2
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the HTTP client fails to build or the base URL is invalid.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// let client = StravaClient::new(
-    ///     "client_id".to_string(),
-    ///     "client_secret".to_string(),
-    ///     "refresh_token".to_string()
-    /// )?;
-    /// ```
     pub fn new(id: String, secret: String, initial_refresh_token: String) -> anyhow::Result<Self> {
         Ok(Self {
             http: Client::builder()
@@ -116,6 +89,7 @@ impl StravaClient {
                 refresh_token: initial_refresh_token,
                 expires_at: 0,
             })),
+            processed_activities: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -129,20 +103,11 @@ impl StravaClient {
         token_state.expires_at.saturating_sub(current_time) < five_minutes_buffer
     }
 
-    /// Refreshes the OAuth2 access token using the refresh token.
-    ///
-    /// This is called automatically when the token is expired or about to expire.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the token refresh request fails or returns invalid data.
     async fn refresh_access_token(&self) -> anyhow::Result<()> {
         let refresh_token = {
             let token_state = self.token.lock().unwrap();
             token_state.refresh_token.clone()
         };
-
-        println!("Refreshing Strava access token");
 
         let response = Client::new()
             .post("https://www.strava.com/oauth/token")
@@ -163,10 +128,6 @@ impl StravaClient {
         token_state.refresh_token = response.refresh_token;
         token_state.expires_at = response.expires_at;
 
-        println!(
-            "Token refreshed successfully, expires at: {}",
-            response.expires_at
-        );
         Ok(())
     }
 
@@ -179,28 +140,6 @@ impl StravaClient {
         Ok(token_state.access_token.clone())
     }
 
-    /// Fetches a list of the authenticated athlete's activities.
-    ///
-    /// # Arguments
-    ///
-    /// * `page` - Page number (1-indexed)
-    /// * `per_page` - Number of activities per page (max 200)
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the API request fails or returns invalid data.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # async fn example(client: &StravaClient) -> anyhow::Result<()> {
-    /// let activities = client.get_all_activities(1, 50).await?;
-    /// for activity in activities {
-    ///     println!("Activity: {}", activity.name);
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn get_all_activities(
         &self,
         page: u32,
@@ -208,11 +147,6 @@ impl StravaClient {
     ) -> anyhow::Result<Vec<StravaActivitySummary>> {
         let token = self.get_valid_token().await?;
         let url = self.base.join("athlete/activities")?;
-
-        println!(
-            "Getting activities - page: {}, per_page: {}",
-            page, per_page
-        );
 
         let activities = self
             .http
@@ -228,34 +162,9 @@ impl StravaClient {
             .json::<Vec<StravaActivitySummary>>()
             .await?;
 
-        println!("Retrieved {} activities", activities.len());
         Ok(activities)
     }
 
-    /// Updates an existing Strava activity.
-    ///
-    /// # Arguments
-    ///
-    /// * `activity_id` - The ID of the activity to update
-    /// * `update_details` - The fields to update (all fields are optional)
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the activity doesn't exist or the update fails.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # async fn example(client: &StravaClient) -> anyhow::Result<()> {
-    /// let updates = UpdateDetails {
-    ///     name: Some("Morning Run".to_string()),
-    ///     description: Some("Great weather!".to_string()),
-    ///     ..Default::default()
-    /// };
-    /// let updated = client.update_activity("12345".to_string(), updates).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn update_activity(
         &self,
         activity_id: String,
@@ -263,11 +172,6 @@ impl StravaClient {
     ) -> anyhow::Result<StravaActivitySummary> {
         let token = self.get_valid_token().await?;
         let url = self.base.join(&format!("activities/{}", activity_id))?;
-
-        println!(
-            "Making PUT request to /activities/{} with: {:?}",
-            activity_id, update_details
-        );
 
         let result = self
             .http
@@ -291,7 +195,103 @@ impl StravaClient {
             .json::<StravaActivitySummary>()
             .await?;
 
-        println!("Update successful for activity {}", activity_id);
         Ok(activity)
     }
+
+    pub async fn hide_duplicate_indoor_rides(&self) -> anyhow::Result<CleanupResult> {
+        let all_activities = self.get_all_activities(1, 200).await?;
+
+        let processed_set = {
+            let processed = self.processed_activities.lock().unwrap();
+            processed.clone()
+        };
+
+        let public_indoor_bike_activities: Vec<_> = all_activities
+            .iter()
+            .filter(|activity| {
+                is_indoor_bike_activity(activity)
+                    && !activity.private
+                    && !processed_set.contains(&activity.id)
+            })
+            .cloned()
+            .collect();
+
+        let all_virtual_ride_activities: Vec<_> = all_activities
+            .iter()
+            .filter(|activity| activity.activity_type == VIRTUAL_RIDE_ACTIVITY_TYPE)
+            .cloned()
+            .collect();
+
+        let mut hidden_activity_ids = Vec::new();
+        let mut matched_activity_pairs = Vec::new();
+
+        for indoor_bike_activity in public_indoor_bike_activities {
+            if let Some(corresponding_virtual_ride) =
+                all_virtual_ride_activities.iter().find(|virtual_ride| {
+                    are_activities_within_one_hour(&indoor_bike_activity, virtual_ride)
+                })
+            {
+                matched_activity_pairs.push(ActivityMatch {
+                    indoor_activity: ActivityInfo {
+                        id: indoor_bike_activity.id,
+                        name: indoor_bike_activity.name.clone(),
+                        start_date: indoor_bike_activity.start_date.clone(),
+                    },
+                    virtual_ride: ActivityInfo {
+                        id: corresponding_virtual_ride.id,
+                        name: corresponding_virtual_ride.name.clone(),
+                        start_date: corresponding_virtual_ride.start_date.clone(),
+                    },
+                });
+
+                self.update_activity(
+                    indoor_bike_activity.id.to_string(),
+                    UpdateDetails {
+                        hide_from_home: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+
+                {
+                    let mut processed = self.processed_activities.lock().unwrap();
+                    processed.insert(indoor_bike_activity.id);
+                }
+
+                hidden_activity_ids.push(indoor_bike_activity.id);
+            }
+        }
+
+        Ok(CleanupResult {
+            hidden: hidden_activity_ids,
+            matches: matched_activity_pairs,
+        })
+    }
+}
+
+fn is_indoor_bike_activity(activity: &StravaActivitySummary) -> bool {
+    let is_ride_type = activity.activity_type == BIKE_RIDE_ACTIVITY_TYPE;
+    let is_zero_distance = activity.distance == 0.0;
+
+    is_ride_type && is_zero_distance
+}
+
+fn are_activities_within_one_hour(
+    first_activity: &StravaActivitySummary,
+    second_activity: &StravaActivitySummary,
+) -> bool {
+    let first_activity_start = match DateTime::parse_from_rfc3339(&first_activity.start_date) {
+        Ok(dt) => dt.with_timezone(&Utc),
+        Err(_) => return false,
+    };
+
+    let second_activity_start = match DateTime::parse_from_rfc3339(&second_activity.start_date) {
+        Ok(dt) => dt.with_timezone(&Utc),
+        Err(_) => return false,
+    };
+
+    let time_difference = (first_activity_start - second_activity_start).abs();
+    let one_hour = chrono::Duration::hours(1);
+
+    time_difference <= one_hour
 }
