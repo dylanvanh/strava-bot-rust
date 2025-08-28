@@ -62,7 +62,7 @@ pub struct ActivityMatch {
     pub virtual_ride: ActivityInfo,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ActivityInfo {
     pub id: u64,
     pub name: String,
@@ -269,14 +269,14 @@ impl StravaClient {
     }
 }
 
-fn is_indoor_bike_activity(activity: &StravaActivitySummary) -> bool {
+pub fn is_indoor_bike_activity(activity: &StravaActivitySummary) -> bool {
     let is_ride_type = activity.activity_type == BIKE_RIDE_ACTIVITY_TYPE;
     let is_zero_distance = activity.distance == 0.0;
 
     is_ride_type && is_zero_distance
 }
 
-fn are_activities_within_one_hour(
+pub fn are_activities_within_one_hour(
     first_activity: &StravaActivitySummary,
     second_activity: &StravaActivitySummary,
 ) -> bool {
@@ -294,4 +294,122 @@ fn are_activities_within_one_hour(
     let one_hour = chrono::Duration::hours(1);
 
     time_difference <= one_hour
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_activity(
+        id: u64,
+        name: &str,
+        activity_type: &str,
+        start_date: &str,
+        distance: f64,
+        private: bool,
+    ) -> StravaActivitySummary {
+        StravaActivitySummary {
+            id,
+            name: name.to_string(),
+            activity_type: activity_type.to_string(),
+            start_date: start_date.to_string(),
+            distance,
+            private,
+        }
+    }
+
+    #[test]
+    fn test_is_indoor_bike_activity() {
+        let indoor_bike =
+            create_activity(1, "Indoor Bike", "Ride", "2025-01-01T10:00:00Z", 0.0, false);
+        let outdoor_bike = create_activity(
+            2,
+            "Outdoor Bike",
+            "Ride",
+            "2025-01-01T10:00:00Z",
+            25000.0,
+            false,
+        );
+        let run = create_activity(3, "Run", "Run", "2025-01-01T10:00:00Z", 0.0, false);
+
+        assert!(is_indoor_bike_activity(&indoor_bike));
+        assert!(!is_indoor_bike_activity(&outdoor_bike));
+        assert!(!is_indoor_bike_activity(&run));
+    }
+
+    #[test]
+    fn test_are_activities_within_one_hour() {
+        let base_time = "2025-01-01T10:00:00Z";
+        let within_hour = "2025-01-01T10:30:00Z";
+        let beyond_hour = "2025-01-01T11:30:00Z";
+        let before_hour = "2025-01-01T09:30:00Z";
+
+        let activity1 = create_activity(1, "Activity 1", "Ride", base_time, 0.0, false);
+        let activity2 =
+            create_activity(2, "Activity 2", "VirtualRide", within_hour, 25000.0, false);
+        let activity3 =
+            create_activity(3, "Activity 3", "VirtualRide", beyond_hour, 25000.0, false);
+        let activity4 =
+            create_activity(4, "Activity 4", "VirtualRide", before_hour, 25000.0, false);
+
+        assert!(are_activities_within_one_hour(&activity1, &activity2));
+        assert!(!are_activities_within_one_hour(&activity1, &activity3));
+        assert!(are_activities_within_one_hour(&activity1, &activity4));
+    }
+
+    #[test]
+    fn test_activities_exactly_one_hour_apart_are_within_range() {
+        let base_time = "2025-01-01T10:00:00Z";
+        let exactly_one_hour = "2025-01-01T11:00:00Z";
+
+        let activity1 = create_activity(1, "Activity 1", "Ride", base_time, 0.0, false);
+        let activity2 = create_activity(
+            2,
+            "Activity 2",
+            "VirtualRide",
+            exactly_one_hour,
+            25000.0,
+            false,
+        );
+
+        assert!(are_activities_within_one_hour(&activity1, &activity2));
+    }
+
+    #[test]
+    fn test_are_activities_within_one_hour_invalid_dates() {
+        let valid_time = "2025-01-01T10:00:00Z";
+        let invalid_time = "not-a-date";
+
+        let activity1 = create_activity(1, "Activity 1", "Ride", valid_time, 0.0, false);
+        let activity2 =
+            create_activity(2, "Activity 2", "VirtualRide", invalid_time, 25000.0, false);
+
+        assert!(!are_activities_within_one_hour(&activity1, &activity2));
+        assert!(!are_activities_within_one_hour(&activity2, &activity1));
+    }
+
+    #[test]
+    fn test_cleanup_result_serialization() {
+        let activity_info = ActivityInfo {
+            id: 123,
+            name: "Test Activity".to_string(),
+            start_date: "2025-01-01T10:00:00Z".to_string(),
+        };
+
+        let activity_match = ActivityMatch {
+            indoor_activity: activity_info.clone(),
+            virtual_ride: activity_info,
+        };
+
+        let cleanup_result = CleanupResult {
+            hidden: vec![123, 456],
+            matches: vec![activity_match],
+        };
+
+        let json = serde_json::to_string(&cleanup_result).unwrap();
+        let deserialized: CleanupResult = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(cleanup_result.hidden.len(), deserialized.hidden.len());
+        assert_eq!(cleanup_result.matches.len(), deserialized.matches.len());
+    }
 }
