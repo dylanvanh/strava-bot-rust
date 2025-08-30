@@ -195,6 +195,8 @@ impl StravaClient {
             .json::<StravaActivitySummary>()
             .await?;
 
+        println!("Updated: {} (ID: {})", activity.name, activity_id);
+
         Ok(activity)
     }
 
